@@ -93,6 +93,7 @@ app.post("/register", async (req, res) => {
         email,
         username,
         name,
+        isVerified: true,
         password: hashedPassword,
       },
     });
