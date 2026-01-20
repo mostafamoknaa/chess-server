@@ -31,6 +31,8 @@ model Game {
   blackUser   User?    @relation(fields: [blackUserId], references: [id], name: "BlackUser")
   blackUserId String?
   status      String
+  difficulty  Int?
+  timeLimit   Float?
   moves       String[]
   result      String?
   boardState  String

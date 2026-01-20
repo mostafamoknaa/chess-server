@@ -1,7 +1,16 @@
 const express = require("express");
 const app = express();
 const server = require("http").createServer(app);
-const io = require("socket.io")(server);
+const io = require("socket.io")(server, {
+  cors: {
+    origin: (origin, callback) => {
+      // Allows any origin, including 'null' (for local files)
+      callback(null, true);
+    },
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
 const jsonwebtoken = require("jsonwebtoken");
 const { PrismaClient } = require("@prisma/client");
 const { Resend } = require("resend");
@@ -9,6 +18,18 @@ const bcrypt = require("bcrypt");
 const redis = require("redis");
 const chess = require("chess.js");
 const cors = require("cors");
+let Stockfish;
+try {
+  Stockfish = require("stockfish");
+} catch (e) {
+  console.warn("Stockfish module not found or broken. AI games will not work.");
+  Stockfish = () => {
+    return {
+      postMessage: () => { },
+      onmessage: () => { },
+    };
+  };
+}
 
 require("dotenv").config();
 const secretKey = process.env.SECRET_KEY;
@@ -33,6 +54,7 @@ const subscriber = publisher.duplicate();
 const redisClient = publisher.duplicate();
 
 var matchQueue = [];
+const gameTimers = new Map();
 
 app.use(express.json());
 app.use(
@@ -65,7 +87,7 @@ const sendVerificationEmail = async (email, token) => {
   });
 };
 
-const generateNewGameState = (gameId, whiteUser, blackUser) => {
+const generateNewGameState = (gameId, whiteUser, blackUser, difficulty, timeLimit) => {
   const game = new chess.Chess();
   console.log("Game:", game.fen());
   return {
@@ -75,7 +97,55 @@ const generateNewGameState = (gameId, whiteUser, blackUser) => {
     boardState: game.fen(),
     moves: [],
     status: "In Progress",
+    difficulty,
+    timeLimit,
   };
+};
+
+// AI Move Generation with Stockfish
+const getAIMove = (fen, difficulty = "medium") => {
+  return new Promise((resolve, reject) => {
+    const engine = Stockfish();
+    let bestMove = null;
+
+    // Difficulty settings: depth and skill level
+    const difficultySettings = {
+      easy: { depth: 1, skillLevel: 0 },
+      medium: { depth: 5, skillLevel: 5 },
+      hard: { depth: 10, skillLevel: 10 },
+      expert: { depth: 15, skillLevel: 20 },
+    };
+
+    const settings = difficultySettings[difficulty.toLowerCase()] || difficultySettings.medium;
+
+    engine.onmessage = (event) => {
+      const message = event.data || event;
+
+      if (typeof message === 'string' && message.startsWith('bestmove')) {
+        const match = message.match(/bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/);
+        if (match) {
+          bestMove = match[1];
+          engine.postMessage('quit');
+          resolve(bestMove);
+        }
+      }
+    };
+
+    // Initialize engine
+    engine.postMessage('uci');
+    engine.postMessage('isready');
+    engine.postMessage(`setoption name Skill Level value ${settings.skillLevel}`);
+    engine.postMessage(`position fen ${fen}`);
+    engine.postMessage(`go depth ${settings.depth}`);
+
+    // Timeout fallback
+    setTimeout(() => {
+      if (!bestMove) {
+        engine.postMessage('quit');
+        reject(new Error('AI move timeout'));
+      }
+    }, 10000);
+  });
 };
 
 app.use(express.json());
@@ -359,7 +429,149 @@ io.on("connection", (socket) => {
   console.log("User connected");
 
   socket.on("create-game", async (data) => {
-    const { token } = JSON.parse(data);
+    let parsedData;
+    try {
+      parsedData = typeof data === "string" ? JSON.parse(data) : data;
+    } catch (e) {
+      console.error("DEBUG: Failed to parse create-game data:", e);
+      return;
+    }
+
+    const { token, difficulty, timeLimit, side } = parsedData;
+    if (!token) {
+      return;
+    }
+    const decoded = jsonwebtoken.verify(token, secretKey);
+    if (decoded) {
+      const user = await prisma.user.findFirst({
+        where: {
+          id: decoded.id,
+        },
+      });
+      if (!user) {
+        return;
+      }
+      socket.userId = user.id;
+      const parsedDifficulty = difficulty !== undefined ? parseInt(difficulty) : NaN;
+      const parsedTimeLimit = parseFloat(timeLimit) || 0;
+
+      socket.gamePrefs = {
+        difficulty: isNaN(parsedDifficulty) ? null : parsedDifficulty,
+        timeLimit: isNaN(parsedTimeLimit) ? 0 : parsedTimeLimit,
+        side: (side || "random").toLowerCase()
+      };
+
+      redisClient.lPush("online-users", socket.userId);
+      const gameId = await redisClient.hGet("users", user.id);
+      if (gameId) {
+        console.log("User ", user, " in game:", gameId);
+        socket.join(gameId);
+        const gameState = JSON.parse(await redisClient.hGet("games", gameId));
+        socket.emit("game-start", JSON.stringify(gameState));
+        return;
+      }
+
+      if (user) {
+        user.password = undefined;
+        console.log(`User ${user.username} looking for game. Prefs:`, JSON.stringify(socket.gamePrefs));
+
+        // Find potential opponent in matchQueue
+        let opponentIndex = matchQueue.findIndex(sq => {
+          if (sq.userId === socket.userId) return false;
+
+          if (!sq.gamePrefs) return false;
+
+          if (sq.gamePrefs.difficulty !== socket.gamePrefs.difficulty) return false;
+          if (sq.gamePrefs.timeLimit !== socket.gamePrefs.timeLimit) return false;
+
+          // Side compatibility check
+          const mySide = socket.gamePrefs.side;
+          const oppSide = sq.gamePrefs.side;
+
+          if (mySide === "white" && oppSide === "white") return false;
+          if (mySide === "black" && oppSide === "black") return false;
+
+          return true;
+        });
+
+        if (opponentIndex !== -1) {
+          const opponent = matchQueue.splice(opponentIndex, 1)[0];
+          const gameId = Math.random().toString(36).substring(10);
+          console.log(`Match found! Game ID: ${gameId} between ${user.userId} and ${opponent.userId}`);
+
+          socket.join(gameId);
+          opponent.join(gameId);
+
+          // Determine sides
+          let whiteUser, blackUser;
+          const mySide = socket.gamePrefs.side;
+          const oppSide = opponent.gamePrefs.side;
+
+          if (mySide === "white") {
+            whiteUser = socket.userId;
+            blackUser = opponent.userId;
+          } else if (mySide === "black") {
+            whiteUser = opponent.userId;
+            blackUser = socket.userId;
+          } else if (oppSide === "white") {
+            whiteUser = opponent.userId;
+            blackUser = socket.userId;
+          } else if (oppSide === "black") {
+            whiteUser = socket.userId;
+            blackUser = opponent.userId;
+          } else {
+            // Both are random
+            if (Math.random() > 0.5) {
+              whiteUser = socket.userId;
+              blackUser = opponent.userId;
+            } else {
+              whiteUser = opponent.userId;
+              blackUser = socket.userId;
+            }
+          }
+
+          const gameState = generateNewGameState(
+            gameId,
+            whiteUser,
+            blackUser,
+            socket.gamePrefs.difficulty,
+            socket.gamePrefs.timeLimit
+          );
+
+          redisClient.hSet("games", gameId, JSON.stringify(gameState));
+          redisClient.hSet("users", socket.userId, gameId);
+          redisClient.hSet("users", opponent.userId, gameId);
+
+          // Start Game Timer
+          if (socket.gamePrefs.timeLimit) {
+            const duration = parseFloat(socket.gamePrefs.timeLimit) * 60 * 1000;
+            const timerId = setTimeout(() => {
+              handleGameTimeout(gameId);
+            }, duration);
+            gameTimers.set(gameId, timerId);
+            console.log(`Timer started for game ${gameId}: ${duration}ms`);
+          }
+
+          io.to(gameId).emit("game-start", JSON.stringify(gameState));
+          publisher.publish(
+            "game-start",
+            JSON.stringify({ gameId, gameState })
+          );
+        } else {
+          // Remove any existing entries for this user to avoid stale preferences
+          matchQueue = matchQueue.filter(sq => sq.userId !== socket.userId);
+          matchQueue.push(socket);
+          console.log(`User ${user.username} added to match queue. Size: ${matchQueue.length}`);
+          socket.emit("create-game-response", "Waiting for opponent with same preferences");
+        }
+      } else {
+        console.log("User not found in DB");
+      }
+    }
+  });
+
+  socket.on("create-game-ai", async (data) => {
+    const { token, difficulty } = JSON.parse(data);
     if (!token) {
       return;
     }
@@ -375,47 +587,46 @@ io.on("connection", (socket) => {
       }
       socket.userId = user.id;
       redisClient.lPush("online-users", socket.userId);
-      const gameId = await redisClient.hGet("users", user.id);
-      if (gameId) {
-        console.log("User ", user, " in game:", gameId);
-        socket.join(gameId);
-        const gameState = JSON.parse(await redisClient.hGet("games", gameId));
+
+      // Check if user is already in a game
+      const existingGameId = await redisClient.hGet("users", user.id);
+      if (existingGameId) {
+        console.log("User ", user, " already in game:", existingGameId);
+        socket.join(existingGameId);
+        const gameState = JSON.parse(await redisClient.hGet("games", existingGameId));
         socket.emit("game-start", JSON.stringify(gameState));
         return;
       }
-      if (user) {
-        user.password = undefined;
-        console.log("User created game", user);
-        if (matchQueue.length > 0 && matchQueue[0].userId !== socket.userId) {
-          const opponent = matchQueue.pop();
-          const gameId = Math.random().toString(36).substring(10);
-          console.log("Game ID:", gameId);
-          socket.join(gameId);
-          opponent.join(gameId);
-          const gameState = generateNewGameState(
-            gameId,
-            socket.userId,
-            opponent.userId
-          );
-          redisClient.hSet("games", gameId, JSON.stringify(gameState));
-          redisClient.hSet("users", user.id, gameId);
-          redisClient.hSet("users", opponent.userId, gameId);
-          io.to(gameId).emit("game-start", JSON.stringify(gameState));
-          console.log(io.sockets.adapter.rooms);
-          publisher.publish(
-            "game-start",
-            JSON.stringify({ gameId, gameState })
-          );
-        } else {
-          if (!matchQueue.includes(socket)) {
-            matchQueue.push(socket);
-            console.log("Match queue:", matchQueue);
-            socket.emit("create-game-response", "Waiting for opponent");
-          }
-        }
-      } else {
-        console.log("User not found in DB");
-      }
+
+      // Create AI game
+      const gameId = Math.random().toString(36).substring(10);
+      const aiUserId = "AI";
+      console.log("Creating AI game with ID:", gameId, "Difficulty:", difficulty || "medium");
+
+      socket.join(gameId);
+      const gameState = generateNewGameState(
+        gameId,
+        socket.userId,
+        aiUserId,
+        null, // No PVP numerical difficulty for AI
+        null  // No time limit for AI
+      );
+
+      // Store AI difficulty in game state
+      gameState.isAI = true;
+      gameState.aiDifficulty = difficulty || "medium";
+
+      redisClient.hSet("games", gameId, JSON.stringify(gameState));
+      redisClient.hSet("users", user.id, gameId);
+
+      socket.emit("game-start", JSON.stringify(gameState));
+      console.log("AI game started:", gameState);
+
+      // Publish to database
+      publisher.publish(
+        "game-start",
+        JSON.stringify({ gameId, gameState })
+      );
     }
   });
 
@@ -460,6 +671,13 @@ io.on("connection", (socket) => {
                 redisClient.hDel("games", gameId);
                 redisClient.hDel("users", gameState.whiteUser);
                 redisClient.hDel("users", gameState.blackUser);
+
+                const timer = gameTimers.get(gameId);
+                if (timer) {
+                  clearTimeout(timer);
+                  gameTimers.delete(gameId);
+                }
+
                 io.to(gameId).emit("game-update", JSON.stringify(newGameState));
               }
             }
@@ -519,6 +737,13 @@ io.on("connection", (socket) => {
       redisClient.hDel("games", gameId);
       redisClient.hDel("users", game.whiteUser);
       redisClient.hDel("users", game.blackUser);
+
+      const timer = gameTimers.get(gameId);
+      if (timer) {
+        clearTimeout(timer);
+        gameTimers.delete(gameId);
+      }
+
       io.to(gameId).emit("game-update", JSON.stringify(newGameState));
       return;
     }
@@ -575,16 +800,96 @@ io.on("connection", (socket) => {
       boardState: chessGame.fen(),
       moves: [...game.moves, chessGame.history()[0]],
     };
-    delete chessGame;
     publisher.publish("game-update", JSON.stringify({ gameId, newGameState }));
     if (newGameState.status !== "Completed") {
       redisClient.hSet("games", gameId, JSON.stringify(newGameState));
     }
     if (newGameState.status === "Completed") {
+      redisClient.hDel("games", gameId);
       redisClient.hDel("users", game.whiteUser);
       redisClient.hDel("users", game.blackUser);
+
+      const timer = gameTimers.get(gameId);
+      if (timer) {
+        clearTimeout(timer);
+        gameTimers.delete(gameId);
+      }
     }
     io.to(gameId).emit("game-update", JSON.stringify(newGameState));
+
+    // Auto-trigger AI move if this is an AI game and game is not completed
+    if (newGameState.isAI && newGameState.status !== "Completed") {
+      console.log("Triggering AI move for game:", gameId);
+
+      // Give a small delay for better UX
+      setTimeout(async () => {
+        try {
+          const currentGame = JSON.parse(await redisClient.hGet("games", gameId));
+          if (!currentGame || currentGame.status === "Completed") {
+            return;
+          }
+
+          const aiMove = await getAIMove(currentGame.boardState, currentGame.aiDifficulty);
+          console.log("AI move:", aiMove);
+
+          const aiChessGame = new chess.Chess();
+          aiChessGame.load(currentGame.boardState);
+          aiChessGame.move(aiMove);
+
+          let updatedGame = { ...currentGame };
+
+          // Check game end conditions
+          if (aiChessGame.isCheckmate()) {
+            console.log("AI Checkmate");
+            const winner = aiChessGame.turn() === "w" ? currentGame.blackUser : currentGame.whiteUser;
+            updatedGame = {
+              ...updatedGame,
+              status: "Completed",
+              winner: winner,
+              result: "Checkmate",
+            };
+          }
+          if (aiChessGame.isStalemate()) {
+            console.log("AI Stalemate");
+            updatedGame = {
+              ...updatedGame,
+              status: "Completed",
+              result: "Stalemate",
+            };
+          }
+          if (aiChessGame.isDraw()) {
+            console.log("AI Draw");
+            updatedGame = {
+              ...updatedGame,
+              status: "Completed",
+              result: "Draw",
+            };
+          }
+
+          const aiGameState = {
+            ...updatedGame,
+            boardState: aiChessGame.fen(),
+            moves: [...currentGame.moves, aiChessGame.history()[aiChessGame.history().length - 1]],
+          };
+
+          publisher.publish("game-update", JSON.stringify({ gameId, newGameState: aiGameState }));
+
+          if (aiGameState.status !== "Completed") {
+            redisClient.hSet("games", gameId, JSON.stringify(aiGameState));
+          } else {
+            redisClient.hDel("games", gameId);
+            redisClient.hDel("users", currentGame.whiteUser);
+            if (currentGame.blackUser !== "AI") {
+              redisClient.hDel("users", currentGame.blackUser);
+            }
+          }
+
+          io.to(gameId).emit("game-update", JSON.stringify(aiGameState));
+        } catch (error) {
+          console.error("AI move error:", error);
+        }
+      }, 500);
+    }
   });
 
   socket.on("react", async (data) => {
@@ -610,18 +915,107 @@ io.on("connection", (socket) => {
     console.log("Reaction:", data);
     io.to(gameId).emit("react", JSON.stringify(data));
   });
+
+  socket.on("draw-request", async () => {
+    const userId = socket.userId;
+    if (!userId) return;
+    const gameId = await redisClient.hGet("users", userId);
+    if (!gameId) return;
+    const game = JSON.parse(await redisClient.hGet("games", gameId));
+    if (!game || game.status === "Completed") return;
+
+    const opponentId = game.whiteUser === userId ? game.blackUser : game.whiteUser;
+    if (opponentId === "AI") return; // AI doesn't handle draws yet
+
+    socket.to(gameId).emit("draw-request", JSON.stringify({ requesterId: userId }));
+    console.log(`Draw requested by ${userId} in game ${gameId}`);
+  });
+
+  socket.on("draw-response", async (data) => {
+    const userId = socket.userId;
+    if (!userId) return;
+    const { accepted } = JSON.parse(data);
+    const gameId = await redisClient.hGet("users", userId);
+    if (!gameId) return;
+    const game = JSON.parse(await redisClient.hGet("games", gameId));
+    if (!game || game.status === "Completed") return;
+
+    if (accepted) {
+      const newGameState = {
+        ...game,
+        status: "Completed",
+        winner: null,
+        result: "Draw",
+      };
+
+      publisher.publish(
+        "game-update",
+        JSON.stringify({ gameId, newGameState })
+      );
+
+      redisClient.hDel("games", gameId);
+      redisClient.hDel("users", game.whiteUser);
+      redisClient.hDel("users", game.blackUser);
+
+      const timer = gameTimers.get(gameId);
+      if (timer) {
+        clearTimeout(timer);
+        gameTimers.delete(gameId);
+      }
+
+      io.to(gameId).emit("game-update", JSON.stringify(newGameState));
+      console.log(`Game ${gameId} ended as Draw (Accepted)`);
+    } else {
+      socket.to(gameId).emit("draw-rejected", JSON.stringify({ responderId: userId }));
+      console.log(`Draw request in game ${gameId} was rejected by ${userId}`);
+    }
+  });
 });
+
+const handleGameTimeout = async (gameId) => {
+  const gameStr = await redisClient.hGet("games", gameId);
+  if (!gameStr) return;
+
+  const game = JSON.parse(gameStr);
+  if (game.status === "Completed") return;
+
+  console.log(`Game ${gameId} timed out.`);
+
+  // Determine winner based on whose turn it is
+  // FEN format: "board turn castling enpassant halfmove fullmove"
+  const turn = game.boardState.split(" ")[1];
+  const winner = turn === "w" ? game.blackUser : game.whiteUser;
+
+  const newGameState = {
+    ...game,
+    status: "Completed",
+    winner: winner,
+    result: "Timeout",
+  };
+
+  publisher.publish(
+    "game-update",
+    JSON.stringify({ gameId, newGameState })
+  );
+
+  redisClient.hDel("games", gameId);
+  redisClient.hDel("users", game.whiteUser);
+  redisClient.hDel("users", game.blackUser);
+  gameTimers.delete(gameId);
+
+  io.to(gameId).emit("game-update", JSON.stringify(newGameState));
+};
 
 publisher.connect();
 subscriber.connect();
 redisClient.connect();
 
-app.listen(3000, () => {
-  console.log("Server is running on http://localhost:3000");
+app.listen(3100, () => {
+  console.log("Server is running on http://localhost:3100");
 });
 
-server.listen(4000, () => {
-  console.log("Socket server is running on http://localhost:4000");
+server.listen(4100, () => {
+  console.log("Socket server is running on http://localhost:4100");
 });
 
 subscriber.subscribe("game-update", async function (message, channel) {
@@ -635,7 +1029,7 @@ subscriber.subscribe("game-update", async function (message, channel) {
         boardState: newGameState.boardState,
         moves: newGameState.moves,
         status: newGameState.status,
-        winnerId: newGameState.winner || null,
+        winnerId: newGameState.winner === "AI" ? null : (newGameState.winner || null),
         result: newGameState.result || null,
       },
     });
@@ -646,17 +1040,17 @@ subscriber.subscribe("game-update", async function (message, channel) {
 
 subscriber.subscribe("game-start", async function (message, channel) {
   const { gameId, gameState } = JSON.parse(message);
-  console.log("Game start", gameState);
-  console.log(message);
   try {
     const game = await prisma.game.create({
       data: {
         id: gameId,
         whiteUserId: gameState.whiteUser,
-        blackUserId: gameState.blackUser,
+        blackUserId: gameState.blackUser === "AI" ? null : gameState.blackUser,
         boardState: gameState.boardState,
         moves: gameState.moves,
         status: "In Progress",
+        difficulty: (gameState.difficulty !== undefined && gameState.difficulty !== null && !isNaN(parseInt(gameState.difficulty))) ? parseInt(gameState.difficulty) : null,
+        timeLimit: parseFloat(gameState.timeLimit) || 0,
       },
     });
   } catch (e) {

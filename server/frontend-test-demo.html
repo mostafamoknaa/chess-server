@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess Backend Test - Frontend Demo</title>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f7f6; color: #333; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
+        .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); width: 100%; max-width: 600px; }
+        h1 { font-size: 1.5rem; margin-bottom: 1.5rem; color: #2c3e50; }
+        .status { padding: 0.5rem 1rem; border-radius: 8px; font-weight: bold; margin-bottom: 1rem; display: inline-block; }
+        .status.connected { background: #d4edda; color: #155724; }
+        .status.disconnected { background: #f8d7da; color: #721c24; }
+        .log { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 8px; font-family: "Courier New", Courier, monospace; font-size: 0.9rem; height: 300px; overflow-y: auto; white-space: pre-wrap; margin-top: 1rem; }
+        input { width: 100%; padding: 0.8rem; margin-bottom: 1rem; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+        button { width: 100%; padding: 1rem; background: #3498db; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; transition: background 0.3s; }
+        button:hover { background: #2980b9; }
+        button:disabled { background: #bdc3c7; cursor: not-allowed; }
+        .game-info { margin-top: 1rem; padding: 1rem; border-radius: 8px; background: #e8f4fd; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Chess Backend - Frontend Test Demo</h1>
+    
+    <div id="connectionStatus" class="status disconnected">Disconnected</div>
+    
+    <label for="token">JWT Token (obtain from /login):</label>
+    <input type="text" id="token" placeholder="Paste JWT token here...">
+    
+    <button id="createGameBtn" disabled>Create Game</button>
+
+    <div id="gameInfo" class="game-info">
+        <strong>Game Started!</strong>
+        <div id="gameDetails"></div>
+    </div>
+    
+    <div class="log" id="log">Logs will appear here...</div>
+</div>
+
+<script>
+    const logElement = document.getElementById('log');
+    const connectionStatus = document.getElementById('connectionStatus');
+    const createGameBtn = document.getElementById('createGameBtn');
+    const gameInfo = document.getElementById('gameInfo');
+    const gameDetails = document.getElementById('gameDetails');
+    const tokenInput = document.getElementById('token');
+
+    function log(message, type = 'info') {
+        const timestamp = new Date().toLocaleTimeString();
+        const line = `[${timestamp}] ${message}\n`;
+        logElement.textContent += line;
+        logElement.scrollTop = logElement.scrollHeight;
+        console.log(`[${type}] ${message}`);
+    }
+
+    // Connect to Socket.io server
+    const socket = io("http://127.0.0.1:4100", {
+        transports: ["websocket"]
+    });
+
+    socket.on('connect', () => {
+        log('Connected to Server via Socket.io');
+        connectionStatus.textContent = 'Connected';
+        connectionStatus.className = 'status connected';
+        createGameBtn.disabled = false;
+    });
+
+    socket.on('disconnect', (reason) => {
+        log(`Disconnected from Server. Reason: ${reason}`, 'error');
+        connectionStatus.textContent = 'Disconnected';
+        connectionStatus.className = 'status disconnected';
+        createGameBtn.disabled = true;
+    });
+
+    socket.on('connect_error', (err) => {
+        log(`Connection Error: ${err.message}`, 'error');
+        console.error('Socket Connection Error:', err);
+    });
+
+    socket.on('create-game-response', (msg) => {
+        log(`Server Response: ${msg}`);
+    });
+
+    socket.on('game-start', (data) => {
+        const game = JSON.parse(data);
+        log(`GAME STARTED: ${game.gameId}`, 'success');
+        
+        gameInfo.style.display = 'block';
+        gameDetails.innerHTML = `
+            <p><strong>Game ID:</strong> ${game.gameId}</p>
+            <p><strong>White:</strong> ${game.whiteUser}</p>
+            <p><strong>Black:</strong> ${game.blackUser}</p>
+            <p><strong>Board:</strong> ${game.boardState}</p>
+        `;
+    });
+
+    createGameBtn.addEventListener('click', () => {
+        const token = tokenInput.value.trim();
+        if (!token) {
+            alert('Please enter a JWT token first!');
+            return;
+        }
+
+        log('Emitting create-game...');
+        socket.emit('create-game', JSON.stringify({ token }));
+    });
+</script>
+
+</body>
+</html>
