@@ -2,9 +2,8 @@ name: chess
 
 services:
     online-chess:
-        # REPLACE <YOUR_GITHUB_USERNAME> with your actual GitHub username
         image: ghcr.io/mostafamoknaa/chess-server
-        build: ./server
+        # build: ./server
         restart: unless-stopped
         ports:
             - 3100:3000/tcp
@@ -17,6 +16,8 @@ services:
             - RESEND_EMAIL=dummy@example.com
             - REDIS_URL=redis://redis:6379
             - NODE_ENV=production
+            - PORT=3000
+            - SOCKET_PORT=4000
 
         command: sh -c "npx prisma migrate deploy && npm run start"
 
@@ -25,7 +26,7 @@ services:
         image: bitnami/postgresql:latest
         restart: unless-stopped
         ports:
-            - "5433:5432/tcp"
+            - "5434:5432/tcp"
         volumes:
             - pg-data:/bitnami/postgresql
         environment:
