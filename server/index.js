@@ -41,7 +41,7 @@ const node_env = process.env.NODE_ENV;
 const prisma = new PrismaClient();
 const resend = new Resend(resendKey);
 
-if (node_env === "development") {
+if (node_env === "development" && !redisUrl) {
   redisUrl = "redis://localhost:6379";
 }
 
@@ -723,13 +723,18 @@ io.on("connection", (socket) => {
       return;
     }
     if (move === "resign") {
+      const opponentId = game.whiteUser === userId ? game.blackUser : game.whiteUser;
       const newGameState = {
         ...game,
         boardState: game.boardState,
         status: "Completed",
-        winner: game.whiteUser === userId ? game.blackUser : game.whiteUser,
+        winner: opponentId,
         result: "Resignation",
       };
+
+      // Notify opponent about resignation
+      io.to(gameId).emit("player-resigned", JSON.stringify({ resignedPlayer: userId, winner: opponentId }));
+
       publisher.publish(
         "game-update",
         JSON.stringify({ gameId, newGameState })
@@ -927,6 +932,9 @@ io.on("connection", (socket) => {
     const opponentId = game.whiteUser === userId ? game.blackUser : game.whiteUser;
     if (opponentId === "AI") return; // AI doesn't handle draws yet
 
+    // Notify opponent about draw request
+    io.to(gameId).emit("draw-offer", JSON.stringify({ requesterId: userId }));
+
     socket.to(gameId).emit("draw-request", JSON.stringify({ requesterId: userId }));
     console.log(`Draw requested by ${userId} in game ${gameId}`);
   });
@@ -1010,12 +1018,14 @@ publisher.connect();
 subscriber.connect();
 redisClient.connect();
 
-app.listen(3100, () => {
-  console.log("Server is running on http://localhost:3100");
+const PORT = process.env.PORT || 3100;
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
 });
 
-server.listen(4100, () => {
-  console.log("Socket server is running on http://localhost:4100");
+const SOCKET_PORT = process.env.SOCKET_PORT || 4100;
+server.listen(SOCKET_PORT, () => {
+  console.log(`Socket server is running on http://localhost:${SOCKET_PORT}`);
 });
 
 subscriber.subscribe("game-update", async function (message, channel) {
