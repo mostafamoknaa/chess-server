@@ -2,8 +2,8 @@ name: chess
 
 services:
     online-chess:
-        image: ghcr.io/mostafamoknaa/chess-server
-        # build: ./server
+        build: ./server
+        # image: ghcr.io/mostafamoknaa/chess-server
         restart: unless-stopped
         ports:
             - 3100:3000/tcp
